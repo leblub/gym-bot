@@ -17,13 +17,22 @@ META_TOKEN = os.getenv("META_TOKEN", "REPLACE_ME")
 PHONE_ID = os.getenv("PHONE_NUMBER_ID", "1234567890")
 WA_BASE = f"https://graph.facebook.com/v20.0/{PHONE_ID}/messages"
 
+@app.get("/")
+async def health():
+    return {"ok": True}
+
 @app.get("/webhook")
-async def verify(hub_mode: str | None = None,
-                 hub_challenge: str | None = None,
-                 hub_verify_token: str | None = None):
-    if hub_mode == "subscribe" and hub_verify_token == VERIFY:
-        return int(hub_challenge or "0")
-    raise HTTPException(403, "Verification failed")
+async def verify(request: Request):
+    params = dict(request.query_params)  # Roh auslesen: hub.mode, hub.verify_token, hub.challenge
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY and challenge is not None:
+        return int(challenge)  # exakt den Challenge-Wert zurückgeben
+
+    raise HTTPException(status_code=403, detail="Verification failed")
+
 
 @app.post("/webhook")
 async def incoming(req: Request):
