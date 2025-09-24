@@ -54,6 +54,7 @@ async def health():
             print("Redis ping failed:", repr(e))
     return {"ok": True, "details": {"redis": redis_ok}}
 
+
 # ====== Webhook Verify ======
 @app.get("/webhook")
 async def verify(request: Request):
