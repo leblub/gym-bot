@@ -1,3 +1,4 @@
+# main.py
 import os, re
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -51,9 +52,8 @@ async def health():
         try:
             redis_ok = bool(await r.ping())
         except Exception as e:
-            print("Redis ping failed:", repr(e))
+            print("Redis ping failed:", repr(e))  # <— genauer Fehler in Render-Logs
     return {"ok": True, "details": {"redis": redis_ok}}
-
 
 # ====== Webhook Verify ======
 @app.get("/webhook")
@@ -85,7 +85,10 @@ async def incoming(req: Request):
     # einfache Systemkommandos
     if text.lower() in {"stop", "abbrechen", "cancel", "ende"}:
         if memory:
-            await r.delete(f"history:{from_number}")
+            try:
+                await r.delete(f"history:{from_number}")
+            except Exception as e:
+                print("Redis delete failed:", repr(e))
         await send_text(from_number, "Okay, der Dialog ist beendet. Wie kann ich sonst helfen?")
         return {"ok": True}
 
