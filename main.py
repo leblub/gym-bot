@@ -1,18 +1,17 @@
-# main.py
-import os, json, re
+import os, re
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import httpx
 import redis.asyncio as redis
 
-# .env für lokal
+# .env laden (lokal)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-from agent import run_agent, Memory  # <— unser Agent
+from agent import run_agent, Memory  # unser Agent
 
 app = FastAPI()
 
@@ -22,13 +21,13 @@ META_TOKEN = os.getenv("META_TOKEN", "REPLACE_ME")
 PHONE_ID = os.getenv("PHONE_NUMBER_ID", "1234567890")
 WA_BASE = f"https://graph.facebook.com/v20.0/{PHONE_ID}/messages"
 
-REDIS_URL = os.getenv("REDIS_URL")
-REDIS_TLS = os.getenv("REDIS_TLS", "true").lower() == "true"
-redis_kwargs = {}
+REDIS_URL = os.getenv("REDIS_URL", "")
 if REDIS_URL:
-    redis_kwargs = {"ssl": True} if REDIS_TLS else {}
-r = redis.from_url(REDIS_URL, decode_responses=True, **redis_kwargs) if REDIS_URL else None
-memory = Memory(r) if r else None  # ohne Redis würde Agent nicht laufen → setze REDIS_URL!
+    use_ssl = REDIS_URL.startswith("rediss://")
+    r = redis.from_url(REDIS_URL, decode_responses=True, ssl=use_ssl)
+else:
+    r = None
+memory = Memory(r) if r else None
 
 # ====== Helpers ======
 async def send_text(to: str, body: str):
@@ -47,15 +46,23 @@ async def send_text(to: str, body: str):
 # ====== Health ======
 @app.get("/")
 async def health():
-    ok = True
-    details = {"redis": bool(r)}
-    return {"ok": ok, "details": details}
+    redis_ok = False
+    if r:
+        try:
+            redis_ok = bool(await r.ping())
+        except Exception as e:
+            print("Redis ping failed:", repr(e))
+    return {"ok": True, "details": {"redis": redis_ok}}
 
 # ====== Webhook Verify ======
 @app.get("/webhook")
 async def verify(request: Request):
     params = request.query_params
-    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == VERIFY and params.get("hub.challenge"):
+    if (
+        params.get("hub.mode") == "subscribe"
+        and params.get("hub.verify_token") == VERIFY
+        and params.get("hub.challenge")
+    ):
         return PlainTextResponse(params.get("hub.challenge"), status_code=200)
     raise HTTPException(status_code=403, detail="Verification failed")
 
@@ -76,13 +83,12 @@ async def incoming(req: Request):
 
     # einfache Systemkommandos
     if text.lower() in {"stop", "abbrechen", "cancel", "ende"}:
-        # kurz den Verlauf löschen
         if memory:
             await r.delete(f"history:{from_number}")
         await send_text(from_number, "Okay, der Dialog ist beendet. Wie kann ich sonst helfen?")
         return {"ok": True}
 
-    # Agent ausführen (mit Memory/Tools)
+    # Agent mit Memory/Tools
     if not memory:
         await send_text(from_number, "Interner Fehler: Memory nicht konfiguriert.")
         return {"ok": False}
@@ -95,3 +101,14 @@ async def incoming(req: Request):
 
     await send_text(from_number, reply)
     return {"ok": True}
+
+# ====== Test-Agent (ohne WhatsApp) ======
+@app.post("/test-agent")
+async def test_agent(req: Request):
+    data = await req.json()
+    user_id = data.get("user_id", "demo")
+    text = data.get("text", "")
+    if not memory:
+        return {"ok": False, "error": "Memory not configured"}
+    reply = await run_agent(user_id, text, memory)
+    return {"ok": True, "reply": reply}
