@@ -1,5 +1,5 @@
 # main.py
-import os, re
+import os
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import httpx
@@ -12,7 +12,7 @@ try:
 except Exception:
     pass
 
-from agent import run_agent, Memory  # unser Agent
+from agent import run_agent, Memory  # Agent + Memory
 
 app = FastAPI()
 
@@ -22,12 +22,9 @@ META_TOKEN = os.getenv("META_TOKEN", "REPLACE_ME")
 PHONE_ID = os.getenv("PHONE_NUMBER_ID", "1234567890")
 WA_BASE = f"https://graph.facebook.com/v20.0/{PHONE_ID}/messages"
 
+# IMPORTANT: keine ssl-Argumente übergeben; Schema bestimmt TLS
 REDIS_URL = os.getenv("REDIS_URL", "")
-if REDIS_URL:
-    use_ssl = REDIS_URL.startswith("rediss://")
-    r = redis.from_url(REDIS_URL, decode_responses=True, ssl=use_ssl)
-else:
-    r = None
+r = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 memory = Memory(r) if r else None
 
 # ====== Helpers ======
@@ -52,7 +49,7 @@ async def health():
         try:
             redis_ok = bool(await r.ping())
         except Exception as e:
-            print("Redis ping failed:", repr(e))  # <— genauer Fehler in Render-Logs
+            print("Redis ping failed:", repr(e))
     return {"ok": True, "details": {"redis": redis_ok}}
 
 # ====== Webhook Verify ======
