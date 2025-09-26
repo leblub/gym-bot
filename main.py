@@ -13,6 +13,7 @@ except Exception:
     pass
 
 from agent import run_agent, Memory  # Agent + Memory
+from db import init_db, ping_db  # <— NEU
 
 app = FastAPI()
 
@@ -41,7 +42,7 @@ async def send_text(to: str, body: str):
         if resp.status_code >= 400:
             print("WA send error:", resp.status_code, resp.text)
 
-# ====== Health ======
+# Health erweitert: DB-Check optional
 @app.get("/")
 async def health():
     redis_ok = False
@@ -50,7 +51,8 @@ async def health():
             redis_ok = bool(await r.ping())
         except Exception as e:
             print("Redis ping failed:", repr(e))
-    return {"ok": True, "details": {"redis": redis_ok}}
+    db_ok = await ping_db() if os.getenv("DATABASE_URL") else False
+    return {"ok": True, "details": {"redis": redis_ok, "db": db_ok}}
 
 # ====== Webhook Verify ======
 @app.get("/webhook")
@@ -113,3 +115,16 @@ async def test_agent(req: Request):
         return {"ok": False, "error": "Memory not configured"}
     reply = await run_agent(user_id, text, memory)
     return {"ok": True, "reply": reply}
+
+
+@app.on_event("startup")
+async def _startup():
+    dsn = os.getenv("DATABASE_URL", "")
+    if dsn:
+        try:
+            await init_db(dsn)
+            print("DB initialized ✔")
+        except Exception as e:
+            print("DB init failed:", repr(e))
+    else:
+        print("DATABASE_URL missing, DB disabled")
