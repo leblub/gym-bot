@@ -1,6 +1,6 @@
 # db.py
 from __future__ import annotations
-import os, datetime as dt
+import os, datetime as dt, warnings
 from typing import Any, Optional, List, Dict
 from psycopg_pool import AsyncConnectionPool
 
@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS classes (
     capacity    INT NOT NULL DEFAULT 12
 );
 
--- einzelne Termin-Instanzen (Kurstermine)
 CREATE TABLE IF NOT EXISTS sessions (
     id          BIGSERIAL PRIMARY KEY,
     class_id    BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
@@ -34,7 +33,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     UNIQUE (class_id, date, start_time)
 );
 
-CREATE TYPE booking_status AS ENUM ('confirmed','waitlist','canceled');
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'booking_status') THEN
@@ -53,7 +51,6 @@ CREATE TABLE IF NOT EXISTS bookings (
 """
 
 SEED_SQL = """
--- Demo-Daten (nur wenn leer)
 INSERT INTO classes (title, coach, capacity)
 SELECT * FROM (VALUES
   ('BodyPump','Alex',16),
@@ -62,9 +59,8 @@ SELECT * FROM (VALUES
 ) AS v(title, coach, capacity)
 WHERE NOT EXISTS (SELECT 1 FROM classes);
 
--- Erzeuge Termine für heute, wenn keine da sind
 WITH base AS (
-  SELECT id,title,capacity FROM classes
+  SELECT id FROM classes
 )
 INSERT INTO sessions (class_id, date, start_time, end_time)
 SELECT c.id, CURRENT_DATE, t.start_time, t.end_time
@@ -78,40 +74,54 @@ WHERE NOT EXISTS (SELECT 1 FROM sessions WHERE date = CURRENT_DATE);
 """
 
 async def init_db(dsn: str):
+    """Create pool, run schema + seed."""
     global POOL
     if not dsn:
         raise RuntimeError("DATABASE_URL missing")
-    # Async Connection Pool
     POOL = AsyncConnectionPool(dsn, max_size=5)
+    await POOL.open()  # avoid deprecation warning
     async with POOL.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SCHEMA_SQL)
             await cur.execute(SEED_SQL)
 
+async def close_db():
+    global POOL
+    if POOL:
+        await POOL.close()
+        POOL = None
+
 async def ping_db() -> bool:
     if not POOL:
         return False
     try:
-        async with POOL.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT 1;")
-                await cur.fetchone()
+        async with POOL.connection() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT 1;")
+            await cur.fetchone()
         return True
     except Exception:
         return False
 
 # ---------- helpers ----------
-async def get_or_create_member_by_phone(phone: str, name: Optional[str]=None) -> Dict[str, Any]:
+async def get_member_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     assert POOL
     async with POOL.connection() as conn, conn.cursor() as cur:
-        await cur.execute("SELECT id, phone, name FROM members WHERE phone=%s;", (phone,))
-        row = await cur.fetchone()
-        if row:
-            return {"id": row[0], "phone": row[1], "name": row[2]}
-        await cur.execute("INSERT INTO members (phone, name) VALUES (%s,%s) RETURNING id, phone, name;",
+        await cur.execute("SELECT id, phone, name, email FROM members WHERE phone=%s;", (phone,))
+        r = await cur.fetchone()
+        if not r:
+            return None
+        return {"id": r[0], "phone": r[1], "name": r[2], "email": r[3]}
+
+async def get_or_create_member_by_phone(phone: str, name: Optional[str]=None) -> Dict[str, Any]:
+    assert POOL
+    m = await get_member_by_phone(phone)
+    if m:
+        return m
+    async with POOL.connection() as conn, conn.cursor() as cur:
+        await cur.execute("INSERT INTO members (phone, name) VALUES (%s,%s) RETURNING id, phone, name, email;",
                           (phone, name))
         r = await cur.fetchone()
-        return {"id": r[0], "phone": r[1], "name": r[2]}
+        return {"id": r[0], "phone": r[1], "name": r[2], "email": r[3]}
 
 def _to_date_from_when(when: str | None) -> dt.date:
     today = dt.date.today()
@@ -122,7 +132,6 @@ def _to_date_from_when(when: str | None) -> dt.date:
         return today + dt.timedelta(days=1)
     if "heute" in w or "today" in w:
         return today
-    # yyyy-mm-dd
     try:
         return dt.date.fromisoformat(w)
     except Exception:
@@ -146,26 +155,22 @@ async def get_schedule(when: Optional[str]=None) -> List[Dict[str, Any]]:
     async with POOL.connection() as conn, conn.cursor() as cur:
         await cur.execute(sql, (the_date,))
         rows = await cur.fetchall()
-    out = []
-    for r in rows:
-        out.append({
-            "session_id": r[0],
-            "title": r[1],
-            "coach": r[2],
-            "capacity": r[3],
-            "date": r[4].isoformat(),
-            "start_time": r[5].strftime("%H:%M"),
-            "end_time": r[6].strftime("%H:%M"),
-            "remaining": r[7],
-        })
-    return out
+    return [{
+        "session_id": r[0],
+        "title": r[1],
+        "coach": r[2],
+        "capacity": r[3],
+        "date": r[4].isoformat(),
+        "start_time": r[5].strftime("%H:%M"),
+        "end_time": r[6].strftime("%H:%M"),
+        "remaining": r[7],
+    } for r in rows]
 
 async def book_class(session_id: int, member_id: int) -> Dict[str, Any]:
     assert POOL
-    # check remaining
     remain_sql = """
     SELECT
-      c.title, c.coach, c.capacity, s.date, s.start_time, s.end_time,
+      s.id, c.title, c.coach, c.capacity, s.date, s.start_time, s.end_time,
       c.capacity - COALESCE((
         SELECT count(*) FROM bookings b
         WHERE b.session_id = s.id AND b.status='confirmed'
@@ -179,7 +184,7 @@ async def book_class(session_id: int, member_id: int) -> Dict[str, Any]:
         r = await cur.fetchone()
         if not r:
             raise ValueError("Session not found")
-        title, coach, capacity, date, start_time, end_time, remaining = r
+        _, title, coach, capacity, date, start_time, end_time, remaining = r
         status = 'confirmed' if remaining > 0 else 'waitlist'
         await cur.execute(
             "INSERT INTO bookings (session_id, member_id, status) VALUES (%s,%s,%s) "
@@ -196,4 +201,38 @@ async def book_class(session_id: int, member_id: int) -> Dict[str, Any]:
             "start_time": start_time.strftime("%H:%M"),
             "end_time": end_time.strftime("%H:%M"),
             "coach": coach,
+            "session_id": session_id,
+            "member_id": member_id,
+        }
+
+async def get_booking_full(booking_id: int) -> Optional[Dict[str, Any]]:
+    """Join booking + session + class + member for ICS/export."""
+    assert POOL
+    sql = """
+    SELECT
+      b.id, b.status, m.id, m.name, m.phone, m.email,
+      s.id, s.date, s.start_time, s.end_time,
+      c.id, c.title, c.coach
+    FROM bookings b
+    JOIN members m ON m.id = b.member_id
+    JOIN sessions s ON s.id = b.session_id
+    JOIN classes c  ON c.id = s.class_id
+    WHERE b.id = %s
+    """
+    async with POOL.connection() as conn, conn.cursor() as cur:
+        await cur.execute(sql, (booking_id,))
+        r = await cur.fetchone()
+        if not r:
+            return None
+        return {
+            "booking_id": r[0],
+            "status": r[1],
+            "member": {"id": r[2], "name": r[3], "phone": r[4], "email": r[5]},
+            "session": {
+                "id": r[6],
+                "date": r[7],
+                "start_time": r[8],
+                "end_time": r[9],
+            },
+            "class": {"id": r[10], "title": r[11], "coach": r[12]},
         }
